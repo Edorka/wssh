@@ -1,14 +1,15 @@
-mod protocol;
+pub mod protocol;
 pub mod sshclient;
 use protocol::{Request, Response, SeqRequest, SeqResponse};
 use rand::prelude::*;
 use ssh2::Session as Shell;
-use sshclient::{RunOutput, RunResult, SSHClient, ShellProvider};
+use sshclient::{RunOutput, RunResult, ShellProvider};
 use std::sync::Arc;
 use std::{collections::HashMap, sync::Mutex};
 
 pub struct Session {
     pub shell: Shell,
+    provider: Arc<dyn ShellProvider>,
 }
 
 pub struct Sessions {
@@ -69,13 +70,12 @@ pub fn attend_session_message(command: String, session: &Session) -> String {
 }
 
 impl Session {
-    pub fn new(shell: Shell) -> Self {
-        Session { shell }
+    pub fn new(shell: Shell, provider: Arc<dyn ShellProvider>) -> Self {
+        Session { shell, provider }
     }
     pub fn run_command(&self, command: &str) -> Response {
-        let Session { shell } = &self;
-        let ssh_client = SSHClient;
-        match ssh_client.run_command(shell, command) {
+        let _ = &self.shell;
+        match self.provider.run_command(&self.shell, command) {
             RunResult::Ok(RunOutput(response, code)) => {
                 println!("DONE {command}: {response}");
                 Response::Outcome { response, code }
@@ -143,7 +143,7 @@ impl Sessions {
                         reason: "Done.".to_string(),
                         new_session: false,
                     },
-                    Some(Session::new(opened_shell.clone())),
+                    Some(Session::new(opened_shell.clone(), self.provider.clone())),
                 )
             }
         }
@@ -160,7 +160,7 @@ impl Sessions {
                         platform: "generic".to_string(),
                         host: "unknown".to_string(),
                     },
-                    Some(Session::new(shell.to_owned())),
+                    Some(Session::new(shell.to_owned(), self.provider.clone())),
                 ),
                 None => (
                     Response::Previous {

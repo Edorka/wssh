@@ -5,6 +5,7 @@ use std::net::TcpStream;
 use std::thread;
 use websocket::receiver::Reader;
 use websocket::sender::Writer;
+use websocket::server::NoTlsAcceptor;
 use websocket::sync::{Client, Server};
 use websocket::{Message, OwnedMessage};
 
@@ -31,7 +32,9 @@ impl<'a> WSServer<'a> {
         match reception.next() {
             Some(Ok(message)) => Some(message),
             Some(Err(e)) => {
-                println!("Error processing: {:?}", e);
+                if self.debug {
+                    println!("Error processing: {:?}", e);
+                }
                 let _ = sender.send_message(&Message::close());
                 None
             }
@@ -90,7 +93,6 @@ impl<'a> WSServer<'a> {
     }
 
     fn handle_connection(&self, connection: Client<TcpStream>) -> () {
-        //let mut current: Option<Session> = None;
         let (mut receiver, mut sender) = connection.split().unwrap();
         let achieved = self.attend_messages(&mut receiver, &mut sender);
         match achieved {
@@ -99,10 +101,21 @@ impl<'a> WSServer<'a> {
         };
     }
 
-    pub fn run(&self) -> () {
+    pub fn accept_one(&self, instance: &mut Server<NoTlsAcceptor>) -> Option<Client<TcpStream>> {
+        instance
+            .filter_map(Result::ok)
+            .next()
+            .map(|upgrade| upgrade.accept().unwrap())
+    }
+
+    pub fn bind(&self) -> Server<NoTlsAcceptor> {
         let address = &self.address;
         let instance = Server::bind(address).unwrap();
         println!("Websocket Server listening on: {address}");
+        instance
+    }
+
+    pub fn serve(&self, instance: Server<NoTlsAcceptor>) -> () {
         thread::scope(|s| {
             for connection in instance.filter_map(Result::ok) {
                 let client = connection.accept().unwrap();
@@ -111,6 +124,157 @@ impl<'a> WSServer<'a> {
                     self.handle_connection(client);
                 });
             }
+        });
+    }
+
+    pub fn run(&self) -> () {
+        self.serve(self.bind());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::protocol::{Response, SeqResponse};
+    use crate::sessions::sshclient::{RunOutput, RunResult, ShellProvider};
+    use mockall::mock;
+    use mockall::predicate::*;
+    use ssh2::Session as Shell;
+    use std::net::SocketAddr;
+    use websocket::client::ClientBuilder;
+
+    mock! {
+        ShellProvider {}
+        impl ShellProvider for ShellProvider {
+            fn connect(&self, host: &str, user: &str, password: &str) -> Result<Shell, RunOutput>;
+            fn run_command(&self, shell: &Shell, command: &str) -> RunResult;
+        }
+    }
+
+    fn connect(address: SocketAddr) -> Client<TcpStream> {
+        let url = format!("ws://{address}");
+        ClientBuilder::new(&url)
+            .unwrap()
+            .connect_insecure()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_ping_pong() {
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+            let mut client = connect(address);
+            client.send_message(&OwnedMessage::Ping(vec![])).unwrap();
+            client
+                .recv_message()
+                .map(|reply| assert_eq!(reply, OwnedMessage::Pong(vec![])))
+                .unwrap();
+            let _ = client.shutdown();
+            eprintln!("CLIENT DONE");
+        });
+    }
+
+    #[test]
+    fn test_login_flow() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
+            .returning(|_, _, _| Ok(Shell::new().unwrap()));
+        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+            let mut client = connect(address);
+            client
+                .send_message(&OwnedMessage::Text(
+                    serde_json::json!({
+                        "id": 1,
+                        "msg": { "Login": { "user": "user", "passwd": "password" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let reply = client.recv_message().unwrap();
+            match reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 1);
+                    match response.msg {
+                        Response::Authentication {
+                            code, token, ..
+                        } => {
+                            assert_eq!(code, 0);
+                            assert!(token.is_some());
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+            let entries = sessions.entries.lock().unwrap();
+            assert_eq!(entries.keys().len(), 1);
+            let _ = client.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_login_flow_failed() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("wrong"))
+            .returning(|_, _, _| Err(RunOutput("Authentication failed".to_string(), -18)));
+        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+            let mut client = connect(address);
+            client
+                .send_message(&OwnedMessage::Text(
+                    serde_json::json!({
+                        "id": 2,
+                        "msg": { "Login": { "user": "user", "passwd": "wrong" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let reply = client.recv_message().unwrap();
+            match reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    match response.msg {
+                        Response::Authentication {
+                            code, token, ..
+                        } => {
+                            assert_eq!(code, -18);
+                            assert!(token.is_none());
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+            let entries = sessions.entries.lock().unwrap();
+            assert_eq!(entries.keys().len(), 0);
+            let _ = client.shutdown();
         });
     }
 }
