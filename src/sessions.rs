@@ -92,13 +92,7 @@ impl Session {
 }
 
 fn parse_token(source: Option<String>) -> Option<u64> {
-    match source {
-        Some(input) => match input.parse::<u64>() {
-            Result::Ok(number) => Some(number),
-            _ => None,
-        },
-        None => None,
-    }
+    source.and_then(|input| input.parse::<u64>().ok())
 }
 
 impl Sessions {
@@ -134,8 +128,7 @@ impl Sessions {
                 None,
             ),
             Ok(opened_shell) => {
-                let shell = opened_shell.to_owned();
-                let token = Some(self.store_session(shell).to_string());
+                let token = Some(self.store_session(opened_shell.clone()).to_string());
                 (
                     Response::Authentication {
                         code: 0,

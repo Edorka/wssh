@@ -94,11 +94,9 @@ impl<'a> WSServer<'a> {
 
     fn handle_connection(&self, connection: Client<TcpStream>) -> () {
         let (mut receiver, mut sender) = connection.split().unwrap();
-        let achieved = self.attend_messages(&mut receiver, &mut sender);
-        match achieved {
-            Some(session) => self.attend_session_messages(&mut receiver, &mut sender, session),
-            _ => (),
-        };
+        if let Some(session) = self.attend_messages(&mut receiver, &mut sender) {
+            self.attend_session_messages(&mut receiver, &mut sender, session);
+        }
     }
 
     pub fn accept_one(&self, instance: &mut Server<NoTlsAcceptor>) -> Option<Client<TcpStream>> {
