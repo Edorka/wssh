@@ -53,7 +53,7 @@ fn main() {
 
     let matches = Command::new("WebSocket to SSH (WSSH)")
         .version("0.1")
-        .author("Bequant (www.bequant.com)")
+        .author("Eduardo Orive")
         .about("Creates connections to an SSH host")
         .arg(
             Arg::new("PORT")
