@@ -6,6 +6,7 @@ use ssh2::Session as Shell;
 use sshclient::{RunOutput, RunResult, ShellProvider};
 use std::sync::Arc;
 use std::{collections::HashMap, sync::Mutex};
+use log::{debug, info};
 
 pub struct Session {
     pub shell: Shell,
@@ -41,7 +42,7 @@ fn handle_session_command(request: Request, session: &Session) -> Response {
 
 pub fn attend_message<'a>(command: String, sessions: &'a Sessions) -> (String, Option<Session>) {
     let request: SeqRequest = serde_json::from_str(&command).unwrap();
-    print!(
+    debug!(
         "Requested: {:?}",
         serde_json::to_string_pretty(&request).unwrap()
     );
@@ -50,13 +51,13 @@ pub fn attend_message<'a>(command: String, sessions: &'a Sessions) -> (String, O
         id: request.id,
         msg: outcome,
     };
-    println!("Replied: {:?}", response);
+    debug!("Replied: {:?}", response);
     (serde_json::to_string(&response).unwrap(), new_state)
 }
 
 pub fn attend_session_message(command: String, session: &Session) -> String {
     let request: SeqRequest = serde_json::from_str(&command).unwrap();
-    print!(
+    debug!(
         "Requested: {:?}",
         serde_json::to_string_pretty(&request).unwrap()
     );
@@ -65,7 +66,7 @@ pub fn attend_session_message(command: String, session: &Session) -> String {
         id: request.id,
         msg: outcome,
     };
-    println!("Replied: {:?}", response);
+    debug!("Replied: {:?}", response);
     serde_json::to_string(&response).unwrap()
 }
 
@@ -77,11 +78,11 @@ impl Session {
         let _ = &self.shell;
         match self.provider.run_command(&self.shell, command) {
             RunResult::Ok(RunOutput(response, code)) => {
-                println!("DONE {command}: {response}");
+                info!("DONE {command}: {response}");
                 Response::Outcome { response, code }
             }
             RunResult::Err(RunOutput(reason, code)) => {
-                println!("FAILED: {:?}", reason);
+                info!("FAILED: {:?}", reason);
                 Response::Outcome {
                     response: reason,
                     code,
@@ -217,7 +218,7 @@ mod tests {
             None => assert!(true),
         }
         let entries = sessions.entries.lock().unwrap();
-        println!("{:?}", entries.keys());
+        debug!("{:?}", entries.keys());
 
         if let Response::Authentication {
             token: maybe_token,
@@ -225,11 +226,11 @@ mod tests {
             ..
         } = response
         {
-            println!("maybe token: {:?}", maybe_token);
+            debug!("maybe token: {:?}", maybe_token);
             let Some(token) = maybe_token else { assert!(false); return; };
-            println!("{:?}", token);
+            debug!("{:?}", token);
         } else {
-            println!("incorrect response: {:?}", response);
+            debug!("incorrect response: {:?}", response);
             assert!(false)
         };
         let entries_count = entries.keys().len();
@@ -260,7 +261,7 @@ mod tests {
             None => assert!(true),
         }
         let entries = sessions.entries.lock().unwrap();
-        println!("{:?}", entries.keys());
+        debug!("{:?}", entries.keys());
 
         if let Response::Authentication {
             token: None,
@@ -269,9 +270,9 @@ mod tests {
             ..
         } = response
         {
-            println!("{:?}", reason);
+            debug!("{:?}", reason);
         } else {
-            println!("incorrect response: {:?}", response);
+            debug!("incorrect response: {:?}", response);
             assert!(false)
         };
         let entries_count = entries.keys().len();

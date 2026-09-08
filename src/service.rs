@@ -1,6 +1,7 @@
 extern crate websocket;
 
 use crate::sessions::{attend_message, attend_session_message, Session, Sessions};
+use log::{error, info};
 use std::net::TcpStream;
 use std::thread;
 use websocket::receiver::Reader;
@@ -33,7 +34,7 @@ impl<'a> WSServer<'a> {
             Some(Ok(message)) => Some(message),
             Some(Err(e)) => {
                 if self.debug {
-                    println!("Error processing: {:?}", e);
+                    error!("Error processing: {:?}", e);
                 }
                 let _ = sender.send_message(&Message::close());
                 None
@@ -50,20 +51,23 @@ impl<'a> WSServer<'a> {
             match self.fetch_message(receiver, sender) {
                 None => break None,
                 Some(OwnedMessage::Text(input)) => {
-                    let (response, outcome) = attend_message(input.to_string(), self.sessions);
-                    sender
-                        .send_message(&OwnedMessage::Text(response.to_string()))
-                        .unwrap();
-                    match outcome {
-                        None => response,
-                        Some(session) => {
-                            break Some(session);
+                        let (response, outcome) = attend_message(input.to_string(), self.sessions);
+                        if let Err(e) = sender.send_message(&OwnedMessage::Text(response.to_string())) {
+                            error!("Failed to send message: {:?}", e);
+                            break None;
                         }
-                    };
-                }
-                Some(OwnedMessage::Ping(data)) => {
-                    sender.send_message(&OwnedMessage::Pong(data)).unwrap();
-                }
+                        match outcome {
+                            None => response,
+                            Some(session) => {
+                                break Some(session);
+                            }
+                        };
+                    }
+                    Some(OwnedMessage::Ping(data)) => {
+                        if let Err(e) = sender.send_message(&OwnedMessage::Pong(data)) {
+                            error!("Failed to send pong message: {:?}", e);
+                        }
+                    }
                 _ => (),
             }
         };
@@ -80,12 +84,15 @@ impl<'a> WSServer<'a> {
                 None => break,
                 Some(OwnedMessage::Text(input)) => {
                     let response = attend_session_message(input.to_string(), &session);
-                    sender
-                        .send_message(&OwnedMessage::Text(response.to_string()))
-                        .unwrap();
+                    if let Err(e) = sender.send_message(&OwnedMessage::Text(response.to_string())) {
+                        error!("Failed to send message: {:?}", e);
+                        break;
+                    }
                 }
                 Some(OwnedMessage::Ping(data)) => {
-                    sender.send_message(&OwnedMessage::Pong(data)).unwrap();
+                    if let Err(e) = sender.send_message(&OwnedMessage::Pong(data)) {
+                        error!("Failed to send pong message: {:?}", e);
+                    }
                 }
                 _ => (),
             }
@@ -93,7 +100,13 @@ impl<'a> WSServer<'a> {
     }
 
     fn handle_connection(&self, connection: Client<TcpStream>) -> () {
-        let (mut receiver, mut sender) = connection.split().unwrap();
+        let (mut receiver, mut sender) = match connection.split() {
+            Ok((receiver, sender)) => (receiver, sender),
+            Err(e) => {
+                error!("Failed to split connection: {:?}", e);
+                return;
+            }
+        };
         if let Some(session) = self.attend_messages(&mut receiver, &mut sender) {
             self.attend_session_messages(&mut receiver, &mut sender, session);
         }
@@ -103,24 +116,34 @@ impl<'a> WSServer<'a> {
         instance
             .filter_map(Result::ok)
             .next()
-            .map(|upgrade| upgrade.accept().unwrap())
+            .and_then(|upgrade| upgrade.accept().ok())
     }
 
     pub fn bind(&self) -> Server<NoTlsAcceptor> {
         let address = &self.address;
-        let instance = Server::bind(address).unwrap();
-        println!("Websocket Server listening on: {address}");
+        let instance = Server::bind(address)
+            .unwrap_or_else(|e| {
+                error!("Failed to bind to address {}: {:?}", address, e);
+                panic!("Failed to bind to address {}: {:?}", address, e);
+            });
+        info!("Websocket Server listening on: {address}");
         instance
     }
 
     pub fn serve(&self, instance: Server<NoTlsAcceptor>) -> () {
         thread::scope(|s| {
             for connection in instance.filter_map(Result::ok) {
-                let client = connection.accept().unwrap();
-                s.spawn(move || {
-                    println!("connected.");
-                    self.handle_connection(client);
-                });
+                match connection.accept() {
+                    Ok(client) => {
+                        s.spawn(move || {
+                            info!("connected.");
+                            self.handle_connection(client);
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {:?}", e);
+                    }
+                }
             }
         });
     }
@@ -169,13 +192,15 @@ mod tests {
                 server.handle_connection(client);
             });
             let mut client = connect(address);
-            client.send_message(&OwnedMessage::Ping(vec![])).unwrap();
-            client
-                .recv_message()
-                .map(|reply| assert_eq!(reply, OwnedMessage::Pong(vec![])))
-                .unwrap();
+            if let Err(e) = client.send_message(&OwnedMessage::Ping(vec![])) {
+                panic!("Failed to send ping message: {:?}", e);
+            }
+            match client.recv_message() {
+                Ok(reply) => assert_eq!(reply, OwnedMessage::Pong(vec![])),
+                Err(e) => panic!("Failed to receive pong message: {:?}", e),
+            }
             let _ = client.shutdown();
-            eprintln!("CLIENT DONE");
+            info!("CLIENT DONE");
         });
     }
 
@@ -196,16 +221,20 @@ mod tests {
                 server.handle_connection(client);
             });
             let mut client = connect(address);
-            client
-                .send_message(&OwnedMessage::Text(
-                    serde_json::json!({
-                        "id": 1,
-                        "msg": { "Login": { "user": "user", "passwd": "password" } }
-                    })
-                    .to_string(),
-                ))
-                .unwrap();
-            let reply = client.recv_message().unwrap();
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "msg": { "Login": { "user": "user", "passwd": "password" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
             match reply {
                 OwnedMessage::Text(payload) => {
                     let response: SeqResponse = serde_json::from_str(&payload).unwrap();
@@ -245,16 +274,20 @@ mod tests {
                 server.handle_connection(client);
             });
             let mut client = connect(address);
-            client
-                .send_message(&OwnedMessage::Text(
-                    serde_json::json!({
-                        "id": 2,
-                        "msg": { "Login": { "user": "user", "passwd": "wrong" } }
-                    })
-                    .to_string(),
-                ))
-                .unwrap();
-            let reply = client.recv_message().unwrap();
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 2,
+                    "msg": { "Login": { "user": "user", "passwd": "wrong" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
             match reply {
                 OwnedMessage::Text(payload) => {
                     let response: SeqResponse = serde_json::from_str(&payload).unwrap();
@@ -272,6 +305,140 @@ mod tests {
             }
             let entries = sessions.entries.lock().unwrap();
             assert_eq!(entries.keys().len(), 0);
+            let _ = client.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_previous_with_invalid_token() {
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+            let mut client = connect(address);
+            let previous_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 3,
+                    "msg": { "Previous": { "token": "invalid_token" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&previous_message) {
+                panic!("Failed to send previous message: {:?}", e);
+            }
+            let reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive previous response: {:?}", e),
+            };
+            match reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 3);
+                    match response.msg {
+                        Response::Previous {
+                            code, reason, ..
+                        } => {
+                            assert_eq!(code, 1);
+                            assert_eq!(reason, "Invalid token");
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+            let _ = client.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_run_command_in_session_context() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
+            .returning(|_, _, _| Ok(Shell::new().unwrap()));
+        provider
+            .expect_run_command()
+            .with(always(), eq("ls -l"))
+            .returning(|_, _| RunResult::Ok(RunOutput("total 0\n".to_string(), 0)));
+        
+        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+            let mut client = connect(address);
+            
+            // First login to establish a session
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 4,
+                    "msg": { "Login": { "user": "user", "passwd": "password" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let login_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
+            
+            // Verify login response but we don't need to extract the token
+            match &login_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(payload).unwrap();
+                    match &response.msg {
+                        Response::Authentication { token, .. } => {
+                            assert!(token.is_some(), "Expected token in login response");
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            };
+            
+            // Now send a run command
+            let run_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 5,
+                    "msg": { "Run": { "cmd": "ls -l" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&run_message) {
+                panic!("Failed to send run message: {:?}", e);
+            }
+            let run_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive run response: {:?}", e),
+            };
+            
+            match run_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 5);
+                    match response.msg {
+                        Response::Outcome { response, code } => {
+                            assert_eq!(response, "total 0\n");
+                            assert_eq!(code, 0);
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+            
             let _ = client.shutdown();
         });
     }

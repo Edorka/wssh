@@ -2,6 +2,7 @@ use ssh2::{Channel, ErrorCode, KeyboardInteractivePrompt, Prompt, Session};
 use std::io::Read;
 use std::marker::{Send, Sync};
 use std::net::TcpStream; // In order to use Channel::read_to_string()
+use log::error;
 
 #[derive(Debug)]
 pub struct RunOutput(pub String, pub i32);
@@ -30,10 +31,22 @@ unsafe impl Sync for SSHClient {}
 
 impl ShellProvider for SSHClient {
     fn connect(&self, host: &str, username: &str, password: &str) -> Result<Session, RunOutput> {
-        let tcp = TcpStream::connect(host.to_string()).unwrap();
-        let mut sess = Session::new().unwrap();
+        let tcp = match TcpStream::connect(host.to_string()) {
+            Ok(tcp) => tcp,
+            Err(e) => return Err(RunOutput(format!("Failed to connect to {}: {}", host, e), -1)),
+        };
+        
+        let mut sess = match Session::new() {
+            Ok(sess) => sess,
+            Err(e) => return Err(RunOutput(format!("Failed to create SSH session: {}", e), -2)),
+        };
+        
         sess.set_tcp_stream(tcp);
-        sess.handshake().unwrap();
+        
+        if let Err(e) = sess.handshake() {
+            return Err(RunOutput(format!("SSH handshake failed: {}", e), -3));
+        }
+        
         struct Prompter {
             password: String,
         }
@@ -65,11 +78,30 @@ impl ShellProvider for SSHClient {
     }
 
     fn run_command(&self, shell: &Session, command: &str) -> RunResult {
-        let mut channel: Channel = shell.channel_session().unwrap();
-        channel.exec(command).unwrap();
+        let mut channel: Channel = match shell.channel_session() {
+            Ok(channel) => channel,
+            Err(e) => {
+                error!("Failed to create channel: {}", e);
+                return RunResult::Err(RunOutput(format!("Failed to create channel: {}", e), -4));
+            }
+        };
+        
+        if let Err(e) = channel.exec(command) {
+            error!("Failed to execute command '{}': {}", command, e);
+            return RunResult::Err(RunOutput(format!("Failed to execute command '{}': {}", command, e), -5));
+        }
+        
         let mut s = String::new();
-        channel.read_to_string(&mut s).unwrap();
-        channel.wait_close().unwrap();
+        if let Err(e) = channel.read_to_string(&mut s) {
+            error!("Failed to read command output: {}", e);
+            return RunResult::Err(RunOutput(format!("Failed to read command output: {}", e), -6));
+        }
+        
+        if let Err(e) = channel.wait_close() {
+            error!("Failed to close channel: {}", e);
+            return RunResult::Err(RunOutput(format!("Failed to close channel: {}", e), -7));
+        }
+        
         match channel.exit_status() {
             Ok(code) => RunResult::Ok(RunOutput(s, code)),
             Err(ssh_error) => {

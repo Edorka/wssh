@@ -8,6 +8,7 @@ use sessions::sshclient::SSHClient;
 use sessions::Sessions;
 
 fn main() {
+    env_logger::init();
     let matches = Command::new("WebSocket to SSH (WSSH)")
         .version("0.1")
         .author("Bequant (www.bequant.com)")
