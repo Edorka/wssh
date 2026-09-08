@@ -6,7 +6,7 @@ use ssh2::Session as Shell;
 use sshclient::{RunOutput, RunResult, ShellProvider};
 use std::sync::Arc;
 use std::{collections::HashMap, sync::Mutex};
-use log::{debug, info};
+use log::{debug, error, info};
 
 pub struct Session {
     pub shell: Shell,
@@ -41,33 +41,59 @@ fn handle_session_command(request: Request, session: &Session) -> Response {
 }
 
 pub fn attend_message<'a>(command: String, sessions: &'a Sessions) -> (String, Option<Session>) {
-    let request: SeqRequest = serde_json::from_str(&command).unwrap();
-    debug!(
-        "Requested: {:?}",
-        serde_json::to_string_pretty(&request).unwrap()
-    );
-    let (outcome, new_state) = handle_anonymous_command(request.msg, sessions);
-    let response = SeqResponse {
-        id: request.id,
-        msg: outcome,
-    };
-    debug!("Replied: {:?}", response);
-    (serde_json::to_string(&response).unwrap(), new_state)
+    let request: Result<SeqRequest, _> = serde_json::from_str(&command);
+    match request {
+        Ok(req) => {
+            debug!(
+                "Requested: {:?}",
+                serde_json::to_string_pretty(&req).unwrap()
+            );
+            let (outcome, new_state) = handle_anonymous_command(req.msg, sessions);
+            let response = SeqResponse {
+                id: req.id,
+                msg: outcome,
+            };
+            debug!("Replied: {:?}", response);
+            (serde_json::to_string(&response).unwrap(), new_state)
+        }
+        Err(e) => {
+            error!("Failed to parse JSON request: {:?}", e);
+            let response = SeqResponse {
+                id: 0, // Default ID since we couldn't parse the request
+                msg: Response::NotAllowed, // Or another appropriate error response
+            };
+            debug!("Replied with error: {:?}", response);
+            (serde_json::to_string(&response).unwrap(), None)
+        }
+    }
 }
 
 pub fn attend_session_message(command: String, session: &Session) -> String {
-    let request: SeqRequest = serde_json::from_str(&command).unwrap();
-    debug!(
-        "Requested: {:?}",
-        serde_json::to_string_pretty(&request).unwrap()
-    );
-    let outcome = handle_session_command(request.msg, session);
-    let response = SeqResponse {
-        id: request.id,
-        msg: outcome,
-    };
-    debug!("Replied: {:?}", response);
-    serde_json::to_string(&response).unwrap()
+    let request: Result<SeqRequest, _> = serde_json::from_str(&command);
+    match request {
+        Ok(req) => {
+            debug!(
+                "Requested: {:?}",
+                serde_json::to_string_pretty(&req).unwrap()
+            );
+            let outcome = handle_session_command(req.msg, session);
+            let response = SeqResponse {
+                id: req.id,
+                msg: outcome,
+            };
+            debug!("Replied: {:?}", response);
+            serde_json::to_string(&response).unwrap()
+        }
+        Err(e) => {
+            error!("Failed to parse JSON request: {:?}", e);
+            let response = SeqResponse {
+                id: 0, // Default ID since we couldn't parse the request
+                msg: Response::NotAllowed, // Or another appropriate error response
+            };
+            debug!("Replied with error: {:?}", response);
+            serde_json::to_string(&response).unwrap()
+        }
+    }
 }
 
 impl Session {

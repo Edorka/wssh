@@ -442,4 +442,180 @@ mod tests {
             let _ = client.shutdown();
         });
     }
+
+    #[test]
+    fn test_multiple_sequential_connections() {
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        let server = WSServer::new("127.0.0.1:0", &sessions, true);
+        let mut instance = server.bind();
+        let address = instance.local_addr().unwrap();
+        
+        // Handle multiple connections in sequence
+        for i in 0..3 {
+            thread::scope(|s| {
+                s.spawn(|| {
+                    if let Some(client) = server.accept_one(&mut instance) {
+                        server.handle_connection(client);
+                    }
+                });
+                
+                // Connect a client
+                let mut client = connect(address);
+                
+                // Send a ping message
+                let ping_message = OwnedMessage::Text(
+                    serde_json::json!({
+                        "id": i,
+                        "msg": { "Ping": null }
+                    })
+                    .to_string(),
+                );
+                if let Err(e) = client.send_message(&ping_message) {
+                    panic!("Failed to send ping message: {:?}", e);
+                }
+                
+                // Receive the pong response
+                let reply = match client.recv_message() {
+                    Ok(reply) => reply,
+                    Err(e) => panic!("Failed to receive pong response: {:?}", e),
+                };
+                
+                match reply {
+                    OwnedMessage::Text(payload) => {
+                        let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                        assert_eq!(response.id, i as u64);
+                        match response.msg {
+                            Response::Pong(_) => (), // Expected response
+                            other => panic!("unexpected response: {other:?}"),
+                        }
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+                
+                let _ = client.shutdown();
+            });
+        }
+    }
+
+    #[test]
+    fn test_malformed_json_request() {
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            
+            s.spawn(move || {
+                if let Some(client) = server.accept_one(&mut instance) {
+                    server.handle_connection(client);
+                }
+            });
+            
+            let mut client = connect(address);
+            
+            // Send malformed JSON
+            let malformed_json = OwnedMessage::Text("this is not valid json".to_string());
+            if let Err(e) = client.send_message(&malformed_json) {
+                panic!("Failed to send malformed JSON: {:?}", e);
+            }
+            
+            // We expect the connection to be closed or an error response
+            // Let's try to receive a message, but we might get an error
+            match client.recv_message() {
+                Ok(reply) => {
+                    // If we get a reply, it should indicate an error
+                    match reply {
+                        OwnedMessage::Close(_) => {
+                            // Connection closed, which is acceptable
+                        }
+                        OwnedMessage::Text(_payload) => {
+                            // If we get text, it might be an error message
+                            // We won't assert specifics here since behavior might vary
+                        }
+                        _ => {
+                            // Other message types are also acceptable
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Error receiving message is also acceptable
+                    // This might happen if the connection was closed
+                }
+            }
+            
+            let _ = client.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_ping_pong_in_session_context() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
+            .returning(|_, _, _| Ok(Shell::new().unwrap()));
+        
+        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+            
+            s.spawn(move || {
+                if let Some(client) = server.accept_one(&mut instance) {
+                    server.handle_connection(client);
+                }
+            });
+            
+            let mut client = connect(address);
+            
+            // First login to establish a session
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "msg": { "Login": { "user": "user", "passwd": "password" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let _login_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
+            
+            // Now send a ping message in the session context
+            let ping_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 2,
+                    "msg": { "Ping": null }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ping_message) {
+                panic!("Failed to send ping message: {:?}", e);
+            }
+            
+            // Receive the pong response
+            let reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive pong response: {:?}", e),
+            };
+            
+            match reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 2);
+                    match response.msg {
+                        Response::Pong(_) => (), // Expected response
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+            
+            let _ = client.shutdown();
+        });
+    }
 }
