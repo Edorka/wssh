@@ -752,4 +752,165 @@ mod tests {
             let _ = client.shutdown();
         });
     }
+
+    #[test]
+    fn test_acknowledge_with_forged_token_is_rejected() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
+            .returning(|_, _, _| Ok(Shell::new().unwrap()));
+
+        let sessions = Sessions::new(
+            "127.0.0.1:0",
+            provider,
+            true,
+            Some(Duration::from_millis(1)),
+        );
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+
+            let mut client = connect(address);
+
+            // Login to establish a session
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "msg": { "Login": { "user": "user", "passwd": "password" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let login_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
+            let old_token = match &login_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(payload).unwrap();
+                    match &response.msg {
+                        Response::Authentication {
+                            token: Some(token),
+                            ..
+                        } => token.clone(),
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            };
+
+            // Let the rotation period elapse, then ping to get a pending token
+            thread::sleep(Duration::from_millis(20));
+            let ping_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 2,
+                    "msg": { "Ping": null }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ping_message) {
+                panic!("Failed to send ping message: {:?}", e);
+            }
+            let ping_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive pong response: {:?}", e),
+            };
+            let pending_token = match ping_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    match response.msg {
+                        Response::Pong {
+                            new_token: Some(token),
+                            ..
+                        } => token,
+                        other => panic!("expected pong with new_token, got: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            };
+
+            // Attempt to force the session onto a client-chosen token
+            let forged_token = pending_token
+                .parse::<u64>()
+                .unwrap()
+                .wrapping_add(1)
+                .to_string();
+            let ack_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 3,
+                    "msg": { "Acknowledge": { "token": forged_token } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ack_message) {
+                panic!("Failed to send acknowledge message: {:?}", e);
+            }
+            let ack_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive acknowledge response: {:?}", e),
+            };
+            match ack_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 3);
+                    match response.msg {
+                        Response::Acknowledged { code } => assert_eq!(code, 1),
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+
+            // State is untouched: old token current, same pending token, forged absent
+            let entries = sessions.entries.lock().unwrap();
+            let old = old_token.parse::<u64>().unwrap();
+            assert!(entries.contains_key(&old));
+            assert!(!entries.contains_key(&forged_token.parse::<u64>().unwrap()));
+            assert_eq!(
+                entries.get(&old).unwrap().pending_token,
+                Some(pending_token.parse::<u64>().unwrap())
+            );
+            drop(entries);
+
+            // The pending rotation survives: next pong offers the same token
+            let ping_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 4,
+                    "msg": { "Ping": null }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ping_message) {
+                panic!("Failed to send ping message: {:?}", e);
+            }
+            let ping_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive pong response: {:?}", e),
+            };
+            match ping_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    match response.msg {
+                        Response::Pong {
+                            new_token: Some(token),
+                            ..
+                        } => assert_eq!(token, pending_token),
+                        other => panic!("expected pong with new_token, got: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+
+            let _ = client.shutdown();
+        });
+    }
 }
