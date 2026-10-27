@@ -7,6 +7,7 @@ use service::WSServer;
 use sessions::sshclient::SSHClient;
 use sessions::Sessions;
 use std::env;
+use std::time::Duration;
 
 // Configuration struct to hold configurable values
 #[derive(Debug)]
@@ -77,6 +78,14 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .help("print debug information verbosely"),
         )
+        .arg(
+            Arg::new("TOKEN_ROTATION_PERIOD")
+                .short('t')
+                .long("token-rotation-period")
+                .help("Session token rotation period in seconds (0 disables rotation)")
+                .value_parser(value_parser!(u64))
+                .default_value("300"),
+        )
         .get_matches();
 
     let port = matches
@@ -89,10 +98,18 @@ fn main() {
 
     let debug = matches.get_flag("DEBUG");
 
+    let rotation_period = matches
+        .get_one::<u64>("TOKEN_ROTATION_PERIOD")
+        .expect("default ensures there is always a value");
+    let rotation_period = match rotation_period {
+        0 => None,
+        secs => Some(Duration::from_secs(*secs)),
+    };
+
     // Use the address from command line arguments, but fall back to config if needed
     let target_endpoint = format!("{}:{}", address, config.ssh_port);
     let provider = SSHClient {};
-    let sessions = Sessions::new(&target_endpoint, provider, true);
+    let sessions = Sessions::new(&target_endpoint, provider, true, rotation_period);
     let listening_endpoint = format!("{}:{}", config.listen_address, port);
     let server = WSServer::new(&listening_endpoint, &sessions, debug);
     server.run();
