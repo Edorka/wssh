@@ -77,13 +77,17 @@ impl<'a> WSServer<'a> {
         &self,
         receiver: &mut Reader<TcpStream>,
         sender: &mut Writer<TcpStream>,
-        session: Session,
+        mut session: Session,
     ) -> () {
         loop {
             match self.fetch_message(receiver, sender) {
                 None => break,
                 Some(OwnedMessage::Text(input)) => {
-                    let response = attend_session_message(input.to_string(), &session);
+                    let (response, rotated) =
+                        attend_session_message(input.to_string(), &session, self.sessions);
+                    if let Some(new_token) = rotated {
+                        session.token = new_token;
+                    }
                     if let Err(e) = sender.send_message(&OwnedMessage::Text(response.to_string())) {
                         error!("Failed to send message: {:?}", e);
                         break;
@@ -162,6 +166,7 @@ mod tests {
     use mockall::predicate::*;
     use ssh2::Session as Shell;
     use std::net::SocketAddr;
+    use std::time::Duration;
     use websocket::client::ClientBuilder;
 
     mock! {
@@ -182,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_ping_pong() {
-        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -211,7 +216,7 @@ mod tests {
             .expect_connect()
             .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
             .returning(|_, _, _| Ok(Shell::new().unwrap()));
-        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        let sessions = Sessions::new("127.0.0.1:0", provider, true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -264,7 +269,7 @@ mod tests {
             .expect_connect()
             .with(eq("127.0.0.1:0"), eq("user"), eq("wrong"))
             .returning(|_, _, _| Err(RunOutput("Authentication failed".to_string(), -18)));
-        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        let sessions = Sessions::new("127.0.0.1:0", provider, true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -311,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_previous_with_invalid_token() {
-        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -367,7 +372,7 @@ mod tests {
             .with(always(), eq("ls -l"))
             .returning(|_, _| RunResult::Ok(RunOutput("total 0\n".to_string(), 0)));
         
-        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        let sessions = Sessions::new("127.0.0.1:0", provider, true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -445,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_multiple_sequential_connections() {
-        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true, None);
         let server = WSServer::new("127.0.0.1:0", &sessions, true);
         let mut instance = server.bind();
         let address = instance.local_addr().unwrap();
@@ -485,7 +490,7 @@ mod tests {
                         let response: SeqResponse = serde_json::from_str(&payload).unwrap();
                         assert_eq!(response.id, i as u64);
                         match response.msg {
-                            Response::Pong(_) => (), // Expected response
+                            Response::Pong { .. } => (), // Expected response
                             other => panic!("unexpected response: {other:?}"),
                         }
                     }
@@ -499,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_malformed_json_request() {
-        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true);
+        let sessions = Sessions::new("127.0.0.1:0", MockShellProvider::new(), true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -555,7 +560,7 @@ mod tests {
             .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
             .returning(|_, _, _| Ok(Shell::new().unwrap()));
         
-        let sessions = Sessions::new("127.0.0.1:0", provider, true);
+        let sessions = Sessions::new("127.0.0.1:0", provider, true, None);
         thread::scope(|s| {
             let server = WSServer::new("127.0.0.1:0", &sessions, true);
             let mut instance = server.bind();
@@ -608,13 +613,142 @@ mod tests {
                     let response: SeqResponse = serde_json::from_str(&payload).unwrap();
                     assert_eq!(response.id, 2);
                     match response.msg {
-                        Response::Pong(_) => (), // Expected response
+                        Response::Pong { .. } => (), // Expected response
                         other => panic!("unexpected response: {other:?}"),
                     }
                 }
                 other => panic!("unexpected message: {other:?}"),
             }
-            
+
+            let _ = client.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_token_rotation_flow() {
+        let mut provider = MockShellProvider::new();
+        provider
+            .expect_connect()
+            .with(eq("127.0.0.1:0"), eq("user"), eq("password"))
+            .returning(|_, _, _| Ok(Shell::new().unwrap()));
+
+        let sessions = Sessions::new(
+            "127.0.0.1:0",
+            provider,
+            true,
+            Some(Duration::from_millis(1)),
+        );
+        thread::scope(|s| {
+            let server = WSServer::new("127.0.0.1:0", &sessions, true);
+            let mut instance = server.bind();
+            let address = instance.local_addr().unwrap();
+
+            s.spawn(move || {
+                let client = server.accept_one(&mut instance).unwrap();
+                server.handle_connection(client);
+            });
+
+            let mut client = connect(address);
+
+            // Login to establish a session
+            let login_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "msg": { "Login": { "user": "user", "passwd": "password" } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&login_message) {
+                panic!("Failed to send login message: {:?}", e);
+            }
+            let login_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive login response: {:?}", e),
+            };
+            let old_token = match &login_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(payload).unwrap();
+                    match &response.msg {
+                        Response::Authentication {
+                            token: Some(token),
+                            ..
+                        } => token.clone(),
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            };
+
+            // Let the rotation period elapse, then ping
+            thread::sleep(Duration::from_millis(20));
+            let ping_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 2,
+                    "msg": { "Ping": null }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ping_message) {
+                panic!("Failed to send ping message: {:?}", e);
+            }
+            let ping_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive pong response: {:?}", e),
+            };
+            let new_token = match ping_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 2);
+                    match response.msg {
+                        Response::Pong {
+                            new_token: Some(token),
+                            ..
+                        } => token,
+                        other => panic!("expected pong with new_token, got: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            };
+            assert_ne!(new_token, old_token);
+
+            // Old token is still valid while the rotation is pending
+            let entries = sessions.entries.lock().unwrap();
+            assert!(entries.contains_key(&old_token.parse::<u64>().unwrap()));
+            drop(entries);
+
+            // Acknowledge the new token to make the rotation effective
+            let ack_message = OwnedMessage::Text(
+                serde_json::json!({
+                    "id": 3,
+                    "msg": { "Acknowledge": { "token": new_token } }
+                })
+                .to_string(),
+            );
+            if let Err(e) = client.send_message(&ack_message) {
+                panic!("Failed to send acknowledge message: {:?}", e);
+            }
+            let ack_reply = match client.recv_message() {
+                Ok(reply) => reply,
+                Err(e) => panic!("Failed to receive acknowledge response: {:?}", e),
+            };
+            match ack_reply {
+                OwnedMessage::Text(payload) => {
+                    let response: SeqResponse = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(response.id, 3);
+                    match response.msg {
+                        Response::Acknowledged { code } => assert_eq!(code, 0),
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+
+            // Rotation is effective: new token stored, old token gone
+            let entries = sessions.entries.lock().unwrap();
+            assert!(entries.contains_key(&new_token.parse::<u64>().unwrap()));
+            assert!(!entries.contains_key(&old_token.parse::<u64>().unwrap()));
+            drop(entries);
+
             let _ = client.shutdown();
         });
     }

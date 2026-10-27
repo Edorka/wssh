@@ -10,12 +10,19 @@ pub enum Response {
         platform: String,
         host: String,
     },
-    Pong(Option<i32>),
+    Pong {
+        value: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_token: Option<String>,
+    },
     Authentication {
         code: i32,
         token: Option<String>,
         new_session: bool,
         reason: String,
+    },
+    Acknowledged {
+        code: i32,
     },
     Outcome {
         code: i32,
@@ -29,6 +36,7 @@ pub enum Response {
 pub enum Request {
     Previous { token: Option<String> },
     Ping(Option<i32>),
+    Acknowledge { token: Option<String> },
     Login { user: String, passwd: String },
     Run { cmd: String },
 }
